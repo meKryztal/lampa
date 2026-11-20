@@ -40,6 +40,7 @@
       if (h['User-Agent']) q += '&ua=' + encodeURIComponent(h['User-Agent']);
       var key = (get('so_proxy_key', '') + '').trim();
       if (key) q += '&key=' + encodeURIComponent(key);
+      if (o.rh) q += '&rh=1';
       url = q;
       h = {};
     } else if (!android()) {
@@ -47,13 +48,18 @@
     }
     network.clear();
     network.timeout(15000);
-    network['native'](url, ok, function (a, c) {
-      fail(network.errorDecode(a, c));
-    }, o.post || false, {
+    var params = {
       dataType: o.dataType || 'text',
       headers: h,
       withCredentials: !android() && !proxy
-    });
+    };
+    if (o.rh) {
+      if (proxy) params.dataType = 'json';
+      else { delete params.dataType; params.returnHeaders = true; }
+    }
+    network['native'](url, ok, function (a, c) {
+      fail(network.errorDecode(a, c));
+    }, o.post || false, params);
   }
 
   // items: [{title, subtitle}], cb(index)
@@ -103,7 +109,7 @@
       return { 'Origin': h, 'Referer': h + '/', 'User-Agent': UA, 'Cookie': cookie() };
     }
     function checkError(str) {
-      if (/id="check-form"|id="loginForm"/.test(str)) return 'HDrezka: требуется авторизация';
+      if (/id="check-form"|id="loginForm"/.test(str)) return 'HDrezka: нужен вход в аккаунт (логин и пароль в настройках, затем «Войти»)';
       if (/anubis/i.test(str)) return 'HDrezka: ' + host() + ' закрыт проверкой Anubis (защита от ботов), нужно другое зеркало';
       if (/<span>MIRROR<\/span>/.test(str)) return 'HDrezka: ' + host() + ' вернул страницу-заглушку, нужно другое зеркало';
       return '';
@@ -243,6 +249,44 @@
       }, function () { fail('HDrezka: не удалось получить поток'); });
     }
 
+    // Вход по логину и паролю: сохраняет cookie сессии
+    function login(ok, fail) {
+      var name = (get('so_rezka_name', '') + '').trim();
+      var pass = get('so_rezka_password', '') + '';
+      if (!name || !pass) return fail('HDrezka: введите логин и пароль в настройках');
+      var post = 'login_name=' + encodeURIComponent(name) + '&login_password=' + encodeURIComponent(pass) + '&login_not_save=0';
+      var h = host();
+      request(h + '/ajax/login/', {
+        post: post, rh: true,
+        headers: { 'Origin': h, 'Referer': h + '/', 'User-Agent': UA }
+      }, function (json) {
+        if (!json || !json.headers) {
+          return fail('HDrezka: не удалось получить cookie (нужен Lampa для Android с поддержкой заголовков или прокси из worker.js)');
+        }
+        var body = json.body;
+        if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
+        body = body || {};
+        if (!body.success) {
+          var already = body.message && body.message.indexOf('Уже авторизован') === 0;
+          return fail('HDrezka: ' + (already ? 'сайт считает вас уже вошедшим, нажмите «Сбросить вход» и повторите' : (body.message || 'вход не выполнен')));
+        }
+        var sc = json.headers['set-cookie'] || json.headers['Set-Cookie'] || [];
+        if (typeof sc === 'string') sc = [sc];
+        var values = {};
+        sc.forEach(function (param) {
+          var parts = param.split(';')[0].split('=');
+          var k = parts.shift();
+          if (!k) return;
+          var v = parts.join('=');
+          if (v === 'deleted') delete values[k]; else values[k] = v;
+        });
+        var cookie = Object.keys(values).map(function (k) { return k + '=' + values[k]; }).join('; ');
+        if (!cookie) return fail('HDrezka: сайт не прислал cookie');
+        Lampa.Storage.set('so_rezka_cookie', cookie);
+        ok();
+      }, function (e) { fail('HDrezka: ' + e); });
+    }
+
     function run(movie, title, year, is_series) {
       noty('HDrezka: поиск...');
       search(title, year, function (items) {
@@ -276,7 +320,7 @@
       }, noty);
     }
 
-    return { run: run };
+    return { run: run, login: login };
   })();
 
   // ---------- Filmix (по плагину fx.js; API приложения Filmix) ----------
@@ -312,13 +356,34 @@
     }
 
     // максимальное качество по подписке аккаунта: бесплатно 720, PRO 1080, PRO+ 2160
+    var accInfo = '';
     function maxQuality(cb) {
       var t = token();
-      if (!t) return cb(720);
+      if (!t) { accInfo = 'нет авторизации, до 720p'; return cb(720); }
       fx('user_profile', t, '', function (j) {
         var u = j && j.user_data;
-        cb(u ? (u.is_pro_plus ? 2160 : (u.is_pro ? 1080 : 720)) : 720);
-      }, function () { cb(720); });
+        var m = u ? (u.is_pro_plus ? 2160 : (u.is_pro ? 1080 : 720)) : 720;
+        accInfo = u ? ((u.is_pro_plus ? 'PRO+' : (u.is_pro ? 'PRO' : 'бесплатный')) + ', до ' + m + 'p') : 'профиль не получен, до 720p';
+        cb(m);
+      }, function () { accInfo = 'профиль не получен, до 720p'; cb(720); });
+    }
+
+    // выбор качества + копирование ссылки (для проверки, если видео не играет)
+    function playQ(label, r) {
+      var keys = Object.keys(r.quality);
+      var items = keys.map(function (k) { return { title: k }; });
+      items.push({ title: 'Скопировать ссылку (' + keys[0] + ')' });
+      choose('Качество (' + accInfo + ')', items, function (i) {
+        if (i === keys.length) {
+          Lampa.Utils.copyTextToClipboard(r.url, function () {
+            noty('Ссылка скопирована: ' + snip(r.url));
+          }, function () {
+            noty('Не удалось скопировать: ' + snip(r.url));
+          });
+          return;
+        }
+        play(label, { url: r.quality[keys[i]], quality: r.quality, subtitles: false });
+      });
     }
 
     function qmap(link, qualities, max) {
@@ -379,18 +444,18 @@
                 if (!r) return noty(noq);
                 var sm = e.link.match(/s(\d+)e(\d+?)_/i);
                 var label = sm ? 'S' + parseInt(sm[1], 10) + 'E' + parseInt(sm[2], 10) : 'серия ' + ek[ei];
-                play(title + ' / ' + label, r);
+                playQ(title + ' / ' + label, r);
               });
             });
           });
         } else if (pl.movie && pl.movie.length) {
           var movies = pl.movie.filter(function (m) { return !isBlocked(m.translation); });
-          if (!movies.length) return noty('Filmix: все озвучки недоступны');
+          if (!movies.length) return noty('Filmix: заблокировано правообладателем для приложения (через API недоступно)');
           chooseAuto('Озвучка', movies.map(function (m) { return { title: m.translation || 'Оригинал' }; }), function (i) {
             var m = movies[i];
             var r = qmap(m.link, null, max);
             if (!r) return noty(noq);
-            play(title + ' / ' + (m.translation || ''), r);
+            playQ(title + ' / ' + (m.translation || ''), r);
           });
         } else if (post && post.id) {
           noty('Filmix: контент найден, но ссылки недоступны (проверьте авторизацию)');
@@ -511,13 +576,30 @@
       ['so_proxy', 'Адрес вашего прокси (Cloudflare Worker)'],
       ['so_proxy_key', 'Ключ прокси (если задан)'],
       ['so_rezka_mirror', 'HDrezka: зеркало (адрес сайта)'],
-      ['so_rezka_cookie', 'HDrezka: cookie (необязательно)']
+      ['so_rezka_name', 'HDrezka: логин'],
+      ['so_rezka_password', 'HDrezka: пароль'],
+      ['so_rezka_cookie', 'HDrezka: cookie (заполняется после входа)']
     ].forEach(function (p) {
       Lampa.SettingsApi.addParam({
         component: 'simple_online',
         param: { name: p[0], type: 'input', values: '', 'default': '' },
         field: { name: p[1] }
       });
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'simple_online',
+      param: { name: 'so_rezka_login', type: 'button' },
+      field: { name: 'HDrezka: войти (по логину и паролю)' },
+      onChange: function () {
+        noty('HDrezka: вход...');
+        Rezka.login(function () { noty('HDrezka: вход выполнен'); }, noty);
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'simple_online',
+      param: { name: 'so_rezka_logout', type: 'button' },
+      field: { name: 'HDrezka: сбросить вход' },
+      onChange: function () { Lampa.Storage.set('so_rezka_cookie', ''); noty('HDrezka: вход сброшен'); }
     });
     Lampa.SettingsApi.addParam({
       component: 'simple_online',
