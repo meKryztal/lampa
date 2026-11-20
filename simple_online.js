@@ -104,7 +104,8 @@
     }
     function checkError(str) {
       if (/id="check-form"|id="loginForm"/.test(str)) return 'HDrezka: требуется авторизация';
-      if (/<span>MIRROR<\/span>|anubis_challenge/.test(str)) return 'HDrezka: сайт вернул защитную проверку, попробуйте другое зеркало или уберите прокси';
+      if (/anubis/i.test(str)) return 'HDrezka: ' + host() + ' закрыт проверкой Anubis (защита от ботов), нужно другое зеркало';
+      if (/<span>MIRROR<\/span>/.test(str)) return 'HDrezka: ' + host() + ' вернул страницу-заглушку, нужно другое зеркало';
       return '';
     }
 
@@ -307,13 +308,24 @@
     }
 
     function run(movie, title, year, is_series) {
+      var queries = [title, movie.original_title || movie.original_name || ''].filter(function (q, i, a) {
+        return q && a.indexOf(q) === i;
+      });
       noty('Filmix: поиск...');
-      request(API + 'suggest' + tok() + '&search_word=' + encodeURIComponent(title), { headers: headers(), dataType: 'json' }, function (json) {
-        if (!Array.isArray(json)) return noty('Filmix: неожиданный ответ: ' + snip(json));
-        var items = json.map(function (e) {
-          return { id: e.id || e.post_id, title: e.title || e.alt_name || '', year: parseInt(e.year) || 0 };
-        }).filter(function (e) { return e.id; });
-        if (!items.length) return noty('Filmix: пустой ответ: ' + snip(json));
+      var attempt = function (qi) {
+        request(API + 'suggest' + tok() + '&search_word=' + encodeURIComponent(queries[qi]), { headers: headers(), dataType: 'json' }, function (json) {
+          if (!Array.isArray(json)) return noty('Filmix: неожиданный ответ: ' + snip(json));
+          var items = json.map(function (e) {
+            return { id: e.id || e.post_id, title: e.title || e.alt_name || '', year: parseInt(e.year) || 0 };
+          }).filter(function (e) { return e.id; });
+          if (!items.length) {
+            if (qi + 1 < queries.length) return attempt(qi + 1);
+            return noty('Filmix: по запросу «' + queries.join('», «') + '» пусто: ' + snip(json));
+          }
+          found(items);
+        }, noty);
+      };
+      var found = function (items) {
         if (year && items.length > 1) {
           var near = items.filter(function (i) { return i.year && Math.abs(i.year - year) <= 1; });
           if (near.length) items = near;
@@ -345,7 +357,8 @@
         };
         if (items.length === 1) open(items[0]);
         else choose('Filmix', items.map(function (i) { return { title: i.title, subtitle: i.year || '' }; }), function (i) { open(items[i]); });
-      }, noty);
+      };
+      attempt(0);
     }
 
     // Авторизация устройства по коду (как у приставок)
