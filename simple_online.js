@@ -279,107 +279,179 @@
     return { run: run };
   })();
 
-  // ---------- Filmix (по API приложения; не проверялось, см. примечания) ----------
+  // ---------- Filmix (по плагину fx.js; API приложения Filmix) ----------
   var Filmix = (function () {
-    var API = 'http://filmixapp.cyou/api/v2/';
+    var HOSTS = ['http://filmixapp.vip/api/v2/', 'http://filmixapp.cyou/api/v2/'];
+    var API = HOSTS[0];
 
     function devId() {
       var id = get('so_filmix_dev_id', '');
       if (!id) { id = rid(16); Lampa.Storage.set('so_filmix_dev_id', id); }
       return id;
     }
-    function tokOf(token) {
-      return '?user_dev_id=' + devId() + '&user_dev_name=Xiaomi&user_dev_token=' + encodeURIComponent(token || '') +
-        '&user_dev_vendor=Xiaomi&user_dev_os=14&user_dev_apk=2.2.0&app_lang=ru-rRU';
+    function token() { return (get('so_filmix_token', '') + '').trim(); }
+    function tokOf(t) {
+      return '?app_lang=ru_RU&user_dev_apk=2.2.13&user_dev_id=' + devId() +
+        '&user_dev_name=Xiaomi+24069PC21G&user_dev_os=12&user_dev_token=' + encodeURIComponent(t || '') +
+        '&user_dev_vendor=Xiaomi';
     }
-    function tok() { return tokOf(get('so_filmix_token', '') + ''); }
     function headers() { return { 'User-Agent': 'okhttp/3.10.0' }; }
+    function norm(s) { return (s || '').toLowerCase().replace(/[^a-zа-я0-9]/g, ''); }
 
-    function qmap(link, qualities) {
-      var map = {}, best = '';
-      var q = (qualities || []).map(Number).filter(function (x) { return x > 0; }).sort(function (a, b) { return b - a; });
+    // запрос к API; при сетевой ошибке пробует запасной адрес
+    function fx(path, t, extra, ok, fail) {
+      var hosts = [API].concat(HOSTS.filter(function (h) { return h !== API; }));
+      (function go(i) {
+        request(hosts[i] + path + tokOf(t) + (extra || ''), { headers: headers(), dataType: 'json' }, function (j) {
+          API = hosts[i];
+          ok(j);
+        }, function (e) {
+          if (i + 1 < hosts.length) go(i + 1); else fail(e);
+        });
+      })(0);
+    }
+
+    // максимальное качество по подписке аккаунта: бесплатно 720, PRO 1080, PRO+ 2160
+    function maxQuality(cb) {
+      var t = token();
+      if (!t) return cb(720);
+      fx('user_profile', t, '', function (j) {
+        var u = j && j.user_data;
+        cb(u ? (u.is_pro_plus ? 2160 : (u.is_pro ? 1080 : 720)) : 720);
+      }, function () { cb(720); });
+    }
+
+    function qmap(link, qualities, max) {
+      if (!link) return null;
+      var q = qualities && qualities.length ? qualities : null;
+      if (!q) {
+        var m = link.match(/\[([\d,\s]*)\]/);
+        q = m ? m[1].split(',') : [];
+      }
+      q = q.map(function (x) { return parseInt(x, 10); }).filter(function (x) { return x > 0 && x <= max; })
+        .sort(function (a, b) { return b - a; });
+      if (!q.length) return null;
+      var map = {};
       q.forEach(function (x) {
-        var u = link.indexOf('%s') !== -1 ? link.replace('%s', x) : link.replace(/\[[\d,]+\]/, x);
-        map[x + 'p'] = u;
-        if (!best) best = u;
+        map[x + 'p'] = link.indexOf('%s') !== -1 ? link.replace('%s', x) : link.replace(/\[[\d,\s]*\]/, x);
       });
-      if (!best) { best = link; map['auto'] = link; }
-      return { url: best, quality: map, subtitles: false };
+      return { url: map[q[0] + 'p'], quality: map, subtitles: false };
+    }
+
+    function chooseAuto(title, items, cb) {
+      if (items.length === 1) cb(0); else choose(title, items, cb);
+    }
+
+    function episodeMap(v) {
+      if (Array.isArray(v)) {
+        var m = {};
+        v.forEach(function (e, i) { m[String(i + 1)] = e; });
+        return m;
+      }
+      return v || {};
+    }
+
+    function isBlocked(name) {
+      return typeof name === 'string' && name.toLowerCase().indexOf('заблокировано ') === 0;
+    }
+
+    function openPost(it, title, max) {
+      fx('post/' + it.id, token(), '', function (post) {
+        var pl = (post && post.player_links) || {};
+        var pls = pl.playlist;
+        var noq = 'Filmix: нет доступных качеств для вашего аккаунта';
+
+        if (pls && !Array.isArray(pls) && Object.keys(pls).length) {
+          // сезон -> озвучка -> серия
+          var seasons = Object.keys(pls).sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+          chooseAuto('Сезон', seasons.map(function (k) {
+            return { title: 'Сезон ' + (k === '-1' ? '1' : k) };
+          }), function (si) {
+            var voices = Object.keys(pls[seasons[si]]);
+            chooseAuto('Озвучка', voices.map(function (v) { return { title: v }; }), function (vi) {
+              var eps = episodeMap(pls[seasons[si]][voices[vi]]);
+              var ek = Object.keys(eps).filter(function (k) { return eps[k] && eps[k].link; })
+                .sort(function (a, b) { return (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0); });
+              if (!ek.length) return noty('Filmix: серии не найдены');
+              choose('Серия', ek.map(function (k) { return { title: 'Серия ' + k }; }), function (ei) {
+                var e = eps[ek[ei]];
+                var r = qmap(e.link, e.qualities, max);
+                if (!r) return noty(noq);
+                var sm = e.link.match(/s(\d+)e(\d+?)_/i);
+                var label = sm ? 'S' + parseInt(sm[1], 10) + 'E' + parseInt(sm[2], 10) : 'серия ' + ek[ei];
+                play(title + ' / ' + label, r);
+              });
+            });
+          });
+        } else if (pl.movie && pl.movie.length) {
+          var movies = pl.movie.filter(function (m) { return !isBlocked(m.translation); });
+          if (!movies.length) return noty('Filmix: все озвучки недоступны');
+          chooseAuto('Озвучка', movies.map(function (m) { return { title: m.translation || 'Оригинал' }; }), function (i) {
+            var m = movies[i];
+            var r = qmap(m.link, null, max);
+            if (!r) return noty(noq);
+            play(title + ' / ' + (m.translation || ''), r);
+          });
+        } else if (post && post.id) {
+          noty('Filmix: контент найден, но ссылки недоступны (проверьте авторизацию)');
+        } else {
+          noty('Filmix: не удалось получить данные фильма');
+        }
+      }, noty);
     }
 
     function run(movie, title, year, is_series) {
-      var queries = [title, movie.original_title || movie.original_name || ''].filter(function (q, i, a) {
-        return q && a.indexOf(q) === i;
-      });
-      // сначала search?story= (как в исходниках Lampa), затем suggest?search_word=
+      var orig = movie.original_title || movie.original_name || '';
+      var queries = [orig, title].filter(function (q, i, a) { return q && a.indexOf(q) === i; });
       var tries = [];
-      queries.forEach(function (q) {
-        tries.push({ q: q, ep: 'search', par: 'story' });
-        tries.push({ q: q, ep: 'suggest', par: 'search_word' });
-      });
+      queries.forEach(function (q) { HOSTS.forEach(function (h) { tries.push({ q: q, host: h }); }); });
       noty('Filmix: поиск...');
-      var lastInfo = '';
+
+      var found = function (items) {
+        items.forEach(function (e) {
+          e.year = parseInt(e.year || (e.alt_name || '').split('-').pop(), 10) || 0;
+        });
+        if (year) {
+          var near = items.filter(function (i) { return i.year > year - 2 && i.year < year + 2; });
+          if (near.length) items = near;
+        }
+        var exact = orig ? items.filter(function (i) { return norm(i.original_title) === norm(orig); }) : [];
+        var pick = function (it) { maxQuality(function (max) { openPost(it, title, max); }); };
+        if (exact.length === 1) return pick(exact[0]);
+        if (items.length === 1) return pick(items[0]);
+        choose('Filmix', items.map(function (i) {
+          return { title: i.title || i.original_title || i.alt_name, subtitle: (i.year || '') + (i.original_title ? ' / ' + i.original_title : '') };
+        }), function (i) { pick(items[i]); });
+      };
+
+      var last = '';
       var attempt = function (i) {
         var t = tries[i];
         var next = function (info) {
-          lastInfo = t.ep + ': ' + info;
+          last = info;
           if (i + 1 < tries.length) return attempt(i + 1);
-          noty('Filmix: не найдено (' + queries.join(' / ') + '). ' + lastInfo);
+          noty('Filmix: не найдено (' + queries.join(' / ') + '). ' + last);
         };
-        request(API + t.ep + tok() + '&' + t.par + '=' + encodeURIComponent(t.q), { headers: headers(), dataType: 'json' }, function (json) {
+        request(t.host + 'search' + tokOf(token()) + '&story=' + encodeURIComponent(t.q), { headers: headers(), dataType: 'json' }, function (json) {
           if (!Array.isArray(json)) return next(snip(json));
-          var items = json.map(function (e) {
-            return { id: e.id || e.post_id, title: e.title || e.alt_name || e.original_title || '', year: parseInt(e.year) || 0 };
-          }).filter(function (e) { return e.id; });
+          var items = json.filter(function (e) { return e && e.id; });
           if (!items.length) return next(snip(json));
+          API = t.host;
           found(items);
         }, function (err) { next(snip(err)); });
-      };
-      var found = function (items) {
-        if (year && items.length > 1) {
-          var near = items.filter(function (i) { return i.year && Math.abs(i.year - year) <= 1; });
-          if (near.length) items = near;
-        }
-        if (!items.length) return noty('Filmix: ничего не найдено');
-        var open = function (it) {
-          request(API + 'post/' + it.id + tok(), { headers: headers(), dataType: 'json' }, function (post) {
-            var pl = (post && post.player_links) || {};
-            if (pl.playlist && Object.keys(pl.playlist).length) {
-              var voices = Object.keys(pl.playlist);
-              choose('Озвучка', voices.map(function (v) { return { title: v }; }), function (vi) {
-                var seasons = pl.playlist[voices[vi]];
-                var sk = Object.keys(seasons);
-                choose('Сезон', sk.map(function (s) { return { title: 'Сезон ' + s }; }), function (si) {
-                  var eps = seasons[sk[si]], ek = Object.keys(eps);
-                  choose('Сезон ' + sk[si], ek.map(function (e) { return { title: 'Серия ' + e }; }), function (ei) {
-                    var e = eps[ek[ei]];
-                    play(title + ' / S' + sk[si] + 'E' + ek[ei], qmap(e.link || '', e.qualities));
-                  });
-                });
-              });
-            } else if (pl.movie && pl.movie.length) {
-              choose('Озвучка', pl.movie.map(function (m) { return { title: m.translation || 'Оригинал' }; }), function (i) {
-                var m = pl.movie[i];
-                play(title + ' / ' + (m.translation || ''), qmap(m.link || '', m.qualities));
-              });
-            } else noty('Filmix: потоки не найдены (возможно, нужна авторизация в настройках)');
-          }, noty);
-        };
-        if (items.length === 1) open(items[0]);
-        else choose('Filmix', items.map(function (i) { return { title: i.title, subtitle: i.year || '' }; }), function (i) { open(items[i]); });
       };
       attempt(0);
     }
 
     // Авторизация устройства по коду (как у приставок)
     function auth() {
-      request(API + 'token_request' + tokOf(''), { headers: headers(), dataType: 'json' }, function (r) {
+      fx('token_request', '', '', function (r) {
         if (!r || r.status !== 'ok' || !r.code || !r.user_code) {
           return noty('Filmix: не удалось получить код: ' + snip(r));
         }
-        var token = r.code, stopped = false, tries = 0, timer;
+        var tkn = r.code, stopped = false, tries = 0, timer;
         var html = $('<div>' +
-          '<div class="about">Откройте на телефоне или компьютере страницу подключения устройств на сайте Filmix (обычно filmix.ac/consoles), войдите в аккаунт и введите код:</div>' +
+          '<div class="about">Откройте на телефоне или компьютере filmix.my/consoles, войдите в аккаунт и введите код:</div>' +
           '<div style="font-size:3em;text-align:center;margin:.5em 0;letter-spacing:.2em"></div>' +
           '<div class="about">Ожидание подтверждения...</div></div>');
         html.find('div').eq(1).text(r.user_code);
@@ -392,16 +464,16 @@
         Lampa.Modal.open({ title: 'Авторизация Filmix', html: html, size: 'small', onBack: close });
         timer = setInterval(function () {
           if (stopped) return;
-          if (++tries > 60) { close(); return noty('Filmix: время ожидания истекло'); }
-          request(API + 'user_profile' + tokOf(token), { headers: headers(), dataType: 'json' }, function (p) {
+          if (++tries > 100) { close(); return noty('Filmix: время ожидания истекло'); }
+          fx('user_profile', tkn, '', function (p) {
             if (stopped) return;
             if (p && p.user_data) {
-              Lampa.Storage.set('so_filmix_token', token);
+              Lampa.Storage.set('so_filmix_token', tkn);
               close();
-              noty('Filmix: устройство авторизовано' + (p.user_data.is_pro ? ' (PRO)' : ''));
+              noty('Filmix: устройство авторизовано' + (p.user_data.is_pro_plus ? ' (PRO+)' : (p.user_data.is_pro ? ' (PRO)' : '')));
             }
           }, function () {});
-        }, 5000);
+        }, 3000);
       }, noty);
     }
 
