@@ -17,6 +17,10 @@
     return s;
   }
   function noty(t) { Lampa.Noty.show(t); }
+  function snip(x) {
+    try { x = typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { x = String(x); }
+    return (x || '').replace(/\s+/g, ' ').slice(0, 160);
+  }
   function back() { Lampa.Controller.toggle('content'); }
 
   function proxyUrl() {
@@ -100,7 +104,7 @@
     }
     function checkError(str) {
       if (/id="check-form"|id="loginForm"/.test(str)) return 'HDrezka: требуется авторизация';
-      if (/<span>MIRROR<\/span>|anubis_challenge/.test(str)) return 'HDrezka: это зеркало не поддерживается, укажите другое в настройках';
+      if (/<span>MIRROR<\/span>|anubis_challenge/.test(str)) return 'HDrezka: сайт вернул защитную проверку, попробуйте другое зеркало или уберите прокси';
       return '';
     }
 
@@ -283,10 +287,11 @@
       if (!id) { id = rid(16); Lampa.Storage.set('so_filmix_dev_id', id); }
       return id;
     }
-    function tok() {
-      return '?user_dev_id=' + devId() + '&user_dev_name=Xiaomi&user_dev_token=' + encodeURIComponent(get('so_filmix_token', '') + '') +
+    function tokOf(token) {
+      return '?user_dev_id=' + devId() + '&user_dev_name=Xiaomi&user_dev_token=' + encodeURIComponent(token || '') +
         '&user_dev_vendor=Xiaomi&user_dev_os=14&user_dev_apk=2.2.0&app_lang=ru-rRU';
     }
+    function tok() { return tokOf(get('so_filmix_token', '') + ''); }
     function headers() { return { 'User-Agent': 'okhttp/3.10.0' }; }
 
     function qmap(link, qualities) {
@@ -304,9 +309,11 @@
     function run(movie, title, year, is_series) {
       noty('Filmix: поиск...');
       request(API + 'suggest' + tok() + '&search_word=' + encodeURIComponent(title), { headers: headers(), dataType: 'json' }, function (json) {
-        var items = (json || []).map(function (e) {
+        if (!Array.isArray(json)) return noty('Filmix: неожиданный ответ: ' + snip(json));
+        var items = json.map(function (e) {
           return { id: e.id || e.post_id, title: e.title || e.alt_name || '', year: parseInt(e.year) || 0 };
         }).filter(function (e) { return e.id; });
+        if (!items.length) return noty('Filmix: пустой ответ: ' + snip(json));
         if (year && items.length > 1) {
           var near = items.filter(function (i) { return i.year && Math.abs(i.year - year) <= 1; });
           if (near.length) items = near;
@@ -341,7 +348,41 @@
       }, noty);
     }
 
-    return { run: run };
+    // Авторизация устройства по коду (как у приставок)
+    function auth() {
+      request(API + 'token_request' + tokOf(''), { headers: headers(), dataType: 'json' }, function (r) {
+        if (!r || r.status !== 'ok' || !r.code || !r.user_code) {
+          return noty('Filmix: не удалось получить код: ' + snip(r));
+        }
+        var token = r.code, stopped = false, tries = 0, timer;
+        var html = $('<div>' +
+          '<div class="about">Откройте на телефоне или компьютере страницу подключения устройств на сайте Filmix (обычно filmix.ac/consoles), войдите в аккаунт и введите код:</div>' +
+          '<div style="font-size:3em;text-align:center;margin:.5em 0;letter-spacing:.2em"></div>' +
+          '<div class="about">Ожидание подтверждения...</div></div>');
+        html.find('div').eq(1).text(r.user_code);
+        function close() {
+          stopped = true;
+          clearInterval(timer);
+          Lampa.Modal.close();
+          Lampa.Controller.toggle('settings_component');
+        }
+        Lampa.Modal.open({ title: 'Авторизация Filmix', html: html, size: 'small', onBack: close });
+        timer = setInterval(function () {
+          if (stopped) return;
+          if (++tries > 60) { close(); return noty('Filmix: время ожидания истекло'); }
+          request(API + 'user_profile' + tokOf(token), { headers: headers(), dataType: 'json' }, function (p) {
+            if (stopped) return;
+            if (p && p.user_data) {
+              Lampa.Storage.set('so_filmix_token', token);
+              close();
+              noty('Filmix: устройство авторизовано' + (p.user_data.is_pro ? ' (PRO)' : ''));
+            }
+          }, function () {});
+        }, 5000);
+      }, noty);
+    }
+
+    return { run: run, auth: auth };
   })();
 
   // ---------- UI ----------
@@ -375,14 +416,25 @@
       ['so_proxy', 'Адрес вашего прокси (Cloudflare Worker)'],
       ['so_proxy_key', 'Ключ прокси (если задан)'],
       ['so_rezka_mirror', 'HDrezka: зеркало (адрес сайта)'],
-      ['so_rezka_cookie', 'HDrezka: cookie (необязательно)'],
-      ['so_filmix_token', 'Filmix: токен (необязательно)']
+      ['so_rezka_cookie', 'HDrezka: cookie (необязательно)']
     ].forEach(function (p) {
       Lampa.SettingsApi.addParam({
         component: 'simple_online',
         param: { name: p[0], type: 'input', values: '', 'default': '' },
         field: { name: p[1] }
       });
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'simple_online',
+      param: { name: 'so_filmix_auth', type: 'button' },
+      field: { name: 'Filmix: авторизовать устройство по коду' },
+      onChange: function () { Filmix.auth(); }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'simple_online',
+      param: { name: 'so_filmix_logout', type: 'button' },
+      field: { name: 'Filmix: сбросить авторизацию' },
+      onChange: function () { Lampa.Storage.set('so_filmix_token', ''); noty('Filmix: авторизация сброшена'); }
     });
   }
 
