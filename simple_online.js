@@ -311,19 +311,29 @@
       var queries = [title, movie.original_title || movie.original_name || ''].filter(function (q, i, a) {
         return q && a.indexOf(q) === i;
       });
+      // сначала search?story= (как в исходниках Lampa), затем suggest?search_word=
+      var tries = [];
+      queries.forEach(function (q) {
+        tries.push({ q: q, ep: 'search', par: 'story' });
+        tries.push({ q: q, ep: 'suggest', par: 'search_word' });
+      });
       noty('Filmix: поиск...');
-      var attempt = function (qi) {
-        request(API + 'suggest' + tok() + '&search_word=' + encodeURIComponent(queries[qi]), { headers: headers(), dataType: 'json' }, function (json) {
-          if (!Array.isArray(json)) return noty('Filmix: неожиданный ответ: ' + snip(json));
+      var lastInfo = '';
+      var attempt = function (i) {
+        var t = tries[i];
+        var next = function (info) {
+          lastInfo = t.ep + ': ' + info;
+          if (i + 1 < tries.length) return attempt(i + 1);
+          noty('Filmix: не найдено (' + queries.join(' / ') + '). ' + lastInfo);
+        };
+        request(API + t.ep + tok() + '&' + t.par + '=' + encodeURIComponent(t.q), { headers: headers(), dataType: 'json' }, function (json) {
+          if (!Array.isArray(json)) return next(snip(json));
           var items = json.map(function (e) {
-            return { id: e.id || e.post_id, title: e.title || e.alt_name || '', year: parseInt(e.year) || 0 };
+            return { id: e.id || e.post_id, title: e.title || e.alt_name || e.original_title || '', year: parseInt(e.year) || 0 };
           }).filter(function (e) { return e.id; });
-          if (!items.length) {
-            if (qi + 1 < queries.length) return attempt(qi + 1);
-            return noty('Filmix: по запросу «' + queries.join('», «') + '» пусто: ' + snip(json));
-          }
+          if (!items.length) return next(snip(json));
           found(items);
-        }, noty);
+        }, function (err) { next(snip(err)); });
       };
       var found = function (items) {
         if (year && items.length > 1) {
@@ -352,7 +362,7 @@
                 var m = pl.movie[i];
                 play(title + ' / ' + (m.translation || ''), qmap(m.link || '', m.qualities));
               });
-            } else noty('Filmix: потоки не найдены (возможно, нужен токен в настройках)');
+            } else noty('Filmix: потоки не найдены (возможно, нужна авторизация в настройках)');
           }, noty);
         };
         if (items.length === 1) open(items[0]);
